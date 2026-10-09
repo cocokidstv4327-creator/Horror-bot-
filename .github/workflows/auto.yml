@@ -27,7 +27,7 @@ concurrency:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +63,7 @@ jobs:
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           DRY_RUN: ${{ steps.m.outputs.dry }}
+          PRIVACY: private
         run: python main.py ${{ steps.m.outputs.mode }}
 
       - name: Save history
