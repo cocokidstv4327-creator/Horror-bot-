@@ -38,7 +38,7 @@ VOICES = ["hi-IN-MadhurNeural", "hi-IN-SwaraNeural"]
 
 if MODE == "short":
     W, H = 1080, 1920
-    TARGET_WORDS, SCENES = 120, 6
+    TARGET_WORDS, SCENES = 90, 5
     FONT_SIZE, MARGIN_V, CHUNK_WORDS = 66, 420, 4
 else:
     W, H = 1280, 720
