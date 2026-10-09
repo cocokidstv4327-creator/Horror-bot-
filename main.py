@@ -26,8 +26,9 @@ HISTORY_FILE = pathlib.Path("history.json")
 
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODELS = [
-    os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-    "gemini-2.0-flash",
+    os.environ.get("GEMINI_MODEL", "gemini-3.8-flash"),
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
     "gemini-flash-latest",
 ]
 PRIVACY = os.environ.get("PRIVACY", "public")  # public / unlisted / private
