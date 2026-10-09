@@ -4,6 +4,7 @@ Usage:  python main.py short   |   python main.py long
 Pipeline: Gemini story -> edge-tts Hindi voice -> AI images -> ffmpeg video -> YouTube upload
 """
 import asyncio
+import base64
 import datetime
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import wave
 
 import requests
 
@@ -31,19 +33,28 @@ GEMINI_MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-flash-latest",
 ]
+TTS_MODELS = [
+    os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview"),
+    "gemini-2.5-flash-preview-tts",
+]
 PRIVACY = os.environ.get("PRIVACY", "public")  # public / unlisted / private
 DRY_RUN = os.environ.get("DRY_RUN") == "1"  # build video but do not upload
+POLLI_KEY = os.environ.get("POLLINATIONS_KEY", "").strip()  # optional free key
 
-VOICES = ["hi-IN-MadhurNeural", "hi-IN-SwaraNeural"]
+GEMINI_VOICES = {"male": ["Charon", "Fenrir", "Orus"], "female": ["Kore", "Aoede", "Leda"]}
+EDGE_VOICES = {"male": "hi-IN-MadhurNeural", "female": "hi-IN-SwaraNeural"}
+FPS = 25
 
 if MODE == "short":
-    W, H = 1080, 1920
-    TARGET_WORDS, SCENES = 90, 5
+    W, H = 1080, 1920          # video size
+    IMG_W, IMG_H = 720, 1280   # size requested from image AI
+    TARGET_WORDS, SCENES = 95, 8
     FONT_SIZE, MARGIN_V, CHUNK_WORDS = 66, 420, 4
 else:
-    W, H = 1280, 720
-    TARGET_WORDS, SCENES = 680, 14
-    FONT_SIZE, MARGIN_V, CHUNK_WORDS = 44, 50, 8
+    W, H = 1920, 1080
+    IMG_W, IMG_H = 1280, 720
+    TARGET_WORDS, SCENES = 700, 24
+    FONT_SIZE, MARGIN_V, CHUNK_WORDS = 60, 70, 8
 
 SETTINGS = [
     "सुनसान रेलवे स्टेशन की आख़िरी रात", "पुरानी हवेली का बंद कमरा", "गाँव का सूखा कुआँ",
@@ -82,7 +93,7 @@ def save_history(h):
 # ---------------------------------------------------------------- story
 def build_prompt(setting, structure, recent_titles):
     length_note = (
-        f"लगभग {TARGET_WORDS} शब्द, कुल {SCENES} दृश्य (scenes)। 60 सेकंड से कम में सुनाई जा सके।"
+        f"लगभग {TARGET_WORDS} शब्द, कुल {SCENES} दृश्य (scenes)। 50 सेकंड से कम में सुनाई जा सके।"
         if MODE == "short"
         else f"लगभग {TARGET_WORDS} शब्द, कुल {SCENES} दृश्य (scenes)। सुनाने में करीब 5 मिनट लगें।"
     )
@@ -99,15 +110,23 @@ def build_prompt(setting, structure, recent_titles):
 - कहानी की पहली पंक्ति ऐसी हो कि सुनने वाला तुरंत रुक जाए (हुक)।
 - हर दृश्य के अंत में हल्का सस्पेंस, और आख़िर में दमदार मोड़ या अधूरा सवाल।
 - सरल, बोलचाल की हिंदी (देवनागरी), छोटे वाक्य, जो बोलने में अच्छे लगें।
+- कहानी एक ही सुनाने वाले की ज़ुबानी हो। पूरी कहानी में उसी के लिंग के हिसाब से क्रियाएँ लिखो (जैसे पुरुष: "मैं गया, मैंने देखा"; स्त्री: "मैं गई, मैंने देखा")। लिंग में गड़बड़ी बिल्कुल नहीं होनी चाहिए।
 - ये शीर्षक पहले आ चुके हैं, इनसे अलग रखो: {recent_titles}
+
+चित्रों के नियम (image_prompt):
+- हर image_prompt अंग्रेज़ी में, एक ही साफ़ दृश्य का वर्णन करे (कौन, कहाँ, कैसी रोशनी)।
+- पूरी कहानी में मुख्य पात्र का रूप, कपड़े और जगह का रंग-रूप एक जैसा बताओ ताकि चित्र आपस में मेल खाएँ।
+- चित्र में कोई लिखावट, लोगो, ख़ून या डरावने शरीर के अंग नहीं।
 
 सिर्फ़ यह JSON लौटाओ, और कुछ नहीं:
 {{
  "title": "हिंदी शीर्षक, 70 अक्षर तक, रहस्यमय पर सच्चा (कोई झूठा दावा नहीं)",
  "description": "2-3 पंक्ति का हिंदी विवरण, जो कहानी का अंत न बताए",
  "tags": ["8-12 टैग हिंदी/अंग्रेज़ी"],
+ "narrator_gender": "male या female (सुनाने वाले का लिंग)",
+ "visual_style": "English, one line, one consistent look for ALL images, e.g. photorealistic cinematic horror film still, 35mm, volumetric fog, moody teal and amber lighting",
  "scenes": [
-  {{"narration": "इस दृश्य में बोला जाने वाला हिंदी पाठ", "image_prompt": "English visual description of the scene: dark cinematic atmosphere, moody lighting, no gore, no blood, no text, no logos, no real people"}}
+  {{"narration": "इस दृश्य में बोला जाने वाला हिंदी पाठ", "image_prompt": "English description of one clear scene"}}
  ]
 }}"""
 
@@ -151,6 +170,11 @@ def parse_story(text):
     if len(scenes) < 3:
         raise ValueError("too few scenes")
     story["scenes"] = scenes
+    g = str(story.get("narrator_gender", "male")).lower()
+    story["narrator_gender"] = "female" if g.startswith("f") else "male"
+    story["visual_style"] = str(
+        story.get("visual_style") or "photorealistic cinematic horror film still, 35mm, volumetric fog, moody lighting"
+    )
     return story
 
 
@@ -184,75 +208,6 @@ def probe_duration(path):
     return float(out.decode().strip())
 
 
-async def _tts(text, voice, out):
-    import edge_tts
-
-    # slower and slightly deeper = creepier
-    com = edge_tts.Communicate(text, voice, rate="-10%", pitch="-4Hz")
-    await com.save(str(out))
-
-
-def make_voice(scenes, voice):
-    files = []
-    for i, sc in enumerate(scenes):
-        out = WORK / f"voice_{i:02d}.mp3"
-        for attempt in range(4):
-            try:
-                asyncio.run(_tts(sc["narration"], voice, out))
-                if out.exists() and out.stat().st_size > 1000:
-                    break
-            except Exception as e:  # noqa
-                log("TTS retry:", e)
-                time.sleep(5 * (attempt + 1))
-        else:
-            raise RuntimeError(f"TTS failed for scene {i}")
-        files.append(out)
-    return files
-
-
-# ---------------------------------------------------------------- images
-def fetch_image(prompt, idx, seed):
-    full = (
-        prompt
-        + ", dark horror atmosphere, cinematic, moody lighting, highly detailed, no text, no watermark, no gore"
-    )
-    url = (
-        "https://image.pollinations.ai/prompt/"
-        + urllib.parse.quote(full)
-        + f"?width={W}&height={H}&nologo=true&model=flux&seed={seed + idx}"
-    )
-    out = WORK / f"img_{idx:02d}.jpg"
-    for attempt in range(4):
-        try:
-            r = requests.get(url, timeout=120)
-            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image") and len(r.content) > 5000:
-                out.write_bytes(r.content)
-                return out
-            log(f"image {idx} http {r.status_code}")
-        except Exception as e:  # noqa
-            log(f"image {idx} error: {e}")
-        time.sleep(8 * (attempt + 1))
-    return None
-
-
-def make_images(scenes):
-    seed = random.randint(1, 10**6)
-    paths, failed = [], 0
-    for i, sc in enumerate(scenes):
-        p = fetch_image(sc["image_prompt"], i, seed)
-        if p is None:
-            failed += 1
-            # reuse previous good image rather than uploading a blank frame
-            p = paths[-1] if paths else None
-        paths.append(p)
-    if failed > max(1, len(scenes) * 0.3) or paths[0] is None:
-        raise RuntimeError(f"Too many image failures ({failed}/{len(scenes)}); aborting to protect channel quality")
-    # fill any leading gaps
-    first_good = next(p for p in paths if p)
-    return [p or first_good for p in paths]
-
-
-# ---------------------------------------------------------------- video
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -260,28 +215,211 @@ def run(cmd):
         raise RuntimeError("ffmpeg failed")
 
 
-def make_clip(img, audio, idx, zoom_in):
-    dur = probe_duration(audio) + 0.5
-    frames = int(dur * 25) + 1
-    if zoom_in:
-        z = "min(zoom+0.0012,1.25)"
+def gemini_tts(text, voice):
+    """Returns (pcm_bytes, sample_rate). Gemini TTS gives 16-bit mono PCM."""
+    prompt = "Say in a slow, low, hushed, eerie storyteller voice with natural dramatic pauses:\n" + text
+    last = None
+    for model in TTS_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+            },
+        }
+        for attempt in range(3):
+            try:
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=300)
+                if r.status_code == 200:
+                    parts = r.json()["candidates"][0]["content"]["parts"]
+                    for p in parts:
+                        inline = p.get("inlineData") or p.get("inline_data")
+                        if inline and inline.get("data"):
+                            mime = inline.get("mimeType") or inline.get("mime_type") or ""
+                            m = re.search(r"rate=(\d+)", mime)
+                            rate = int(m.group(1)) if m else 24000
+                            return base64.b64decode(inline["data"]), rate
+                    last = f"{model}: no audio in response"
+                    log("TTS:", last)
+                else:
+                    last = f"{model}: HTTP {r.status_code} {r.text[:200]}"
+                    log("TTS error:", last)
+                    if r.status_code in (400, 404):
+                        break
+                    time.sleep(20 * (attempt + 1))
+            except Exception as e:  # noqa
+                last = f"{model}: {e}"
+                log("TTS exception:", last)
+                time.sleep(10)
+    raise RuntimeError(f"Gemini TTS failed: {last}")
+
+
+def group_scenes(scenes, limit=1400):
+    groups, cur, n = [], [], 0
+    for i, sc in enumerate(scenes):
+        size = len(sc["narration"])
+        if cur and n + size > limit:
+            groups.append(cur)
+            cur, n = [], 0
+        cur.append(i)
+        n += size
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def make_voice_gemini(scenes, gender):
+    voice = random.choice(GEMINI_VOICES[gender])
+    log("Gemini TTS voice:", voice, f"({gender})")
+    gap_s = 0.35
+    pcm_all = bytearray()
+    durs = [0.0] * len(scenes)
+    rate = 24000
+    for g in group_scenes(scenes):
+        text = " ".join(scenes[i]["narration"] for i in g)
+        pcm, rate = gemini_tts(text, voice)
+        dur = len(pcm) / (2 * rate)
+        total_chars = sum(len(scenes[i]["narration"]) for i in g) or 1
+        for i in g:
+            durs[i] = dur * len(scenes[i]["narration"]) / total_chars
+        gap = b"\x00\x00" * int(rate * gap_s)
+        pcm_all += pcm + gap
+        durs[g[-1]] += gap_s
+        time.sleep(5)
+    out = WORK / "narration.wav"
+    with wave.open(str(out), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(bytes(pcm_all))
+    return out, durs
+
+
+async def _tts_edge(text, voice, out):
+    import edge_tts
+
+    com = edge_tts.Communicate(text, voice, rate="-8%")
+    await com.save(str(out))
+
+
+def make_voice_edge(scenes, gender):
+    voice = EDGE_VOICES[gender]
+    log("edge-tts fallback voice:", voice)
+    wavs, durs = [], []
+    for i, sc in enumerate(scenes):
+        mp3 = WORK / f"voice_{i:02d}.mp3"
+        wav = WORK / f"voice_{i:02d}.wav"
+        for attempt in range(4):
+            try:
+                asyncio.run(_tts_edge(sc["narration"], voice, mp3))
+                if mp3.exists() and mp3.stat().st_size > 1000:
+                    break
+            except Exception as e:  # noqa
+                log("edge TTS retry:", e)
+                time.sleep(5 * (attempt + 1))
+        else:
+            raise RuntimeError(f"TTS failed for scene {i}")
+        run(["ffmpeg", "-y", "-i", str(mp3), "-af", "apad=pad_dur=0.4", "-ar", "24000", "-ac", "1",
+             "-c:a", "pcm_s16le", str(wav)])
+        wavs.append(wav)
+        durs.append(probe_duration(wav))
+    lst = WORK / "voices.txt"
+    lst.write_text("".join(f"file '{w.name}'\n" for w in wavs))
+    out = WORK / "narration.wav"
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(out)])
+    return out, durs
+
+
+def make_voice(scenes, gender):
+    try:
+        return make_voice_gemini(scenes, gender)
+    except Exception as e:  # noqa
+        log("Gemini TTS not available, using fallback voice:", e)
+        return make_voice_edge(scenes, gender)
+
+
+def fit_short(narr, durs):
+    total = sum(durs)
+    if MODE != "short" or total <= 56.5:
+        return narr, durs
+    f = total / 56.0
+    if f > 1.3:
+        log(f"WARNING: short narration is {total:.0f}s; too long to speed up safely")
+        return narr, durs
+    out = WORK / "narration_fit.wav"
+    run(["ffmpeg", "-y", "-i", str(narr), "-af", f"atempo={f:.3f}", str(out)])
+    log(f"Short sped up x{f:.2f} to fit under 59s")
+    return out, [d / f for d in durs]
+
+
+# ---------------------------------------------------------------- images
+def fetch_image(prompt, idx, seed, style):
+    full = f"{prompt}, {style}, no text, no watermark, no blood, no gore"
+    q = urllib.parse.quote(full)
+    headers = {}
+    if POLLI_KEY:
+        url = (f"https://gen.pollinations.ai/image/{q}?width={IMG_W}&height={IMG_H}"
+               f"&model=flux&nologo=true&seed={seed + idx}")
+        headers["Authorization"] = f"Bearer {POLLI_KEY}"
+        pause = 2
     else:
-        z = "if(eq(on,0),1.25,max(zoom-0.0012,1.0))"
+        # anonymous tier allows about one request per 15 seconds
+        url = (f"https://image.pollinations.ai/prompt/{q}?width={IMG_W}&height={IMG_H}"
+               f"&model=flux&nologo=true&seed={seed + idx}")
+        pause = 16
+    out = WORK / f"img_{idx:02d}.jpg"
+    for attempt in range(5):
+        try:
+            r = requests.get(url, headers=headers, timeout=180)
+            if r.status_code == 200 and r.headers.get("content-type", "").startswith("image") and len(r.content) > 5000:
+                out.write_bytes(r.content)
+                time.sleep(pause)
+                return out
+            log(f"image {idx} http {r.status_code}")
+        except Exception as e:  # noqa
+            log(f"image {idx} error: {e}")
+        time.sleep(pause + 12 * (attempt + 1))
+    return None
+
+
+def make_images(scenes, style):
+    seed = random.randint(1, 10**6)
+    paths, failed = [], 0
+    for i, sc in enumerate(scenes):
+        p = fetch_image(sc["image_prompt"], i, seed, style)
+        if p is None:
+            failed += 1
+            p = paths[-1] if paths else None
+        paths.append(p)
+        log(f"image {i + 1}/{len(scenes)} {'ok' if p else 'FAILED'}")
+    if failed > max(1, len(scenes) * 0.25) or paths[0] is None:
+        raise RuntimeError(f"Too many image failures ({failed}/{len(scenes)}); aborting to protect channel quality")
+    first_good = next(p for p in paths if p)
+    return [p or first_good for p in paths]
+
+
+# ---------------------------------------------------------------- video
+def make_clip(img, dur, idx, zoom_in):
+    frames = int(dur * FPS) + 1
+    step = 0.16 / max(frames, 1)
+    if zoom_in:
+        z = f"min(zoom+{step:.6f},1.2)"
+    else:
+        z = f"if(eq(on,0),1.2,max(zoom-{step:.6f},1.0))"
+    sw, sh = int(W * 1.5), int(H * 1.5)
     vf = (
-        f"scale={W * 2}:{H * 2}:force_original_aspect_ratio=increase,crop={W * 2}:{H * 2},"
-        f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps=25,"
-        f"vignette=PI/5,noise=alls=7:allf=t,fade=t=in:st=0:d=0.4,fade=t=out:st={dur - 0.4:.2f}:d=0.4,format=yuv420p"
+        f"scale={sw}:{sh}:force_original_aspect_ratio=increase,crop={sw}:{sh},"
+        f"zoompan=z='{z}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={FPS},"
+        f"vignette=PI/5,noise=alls=5:allf=t,fade=t=in:st=0:d=0.3,fade=t=out:st={max(dur - 0.3, 0):.2f}:d=0.3,format=yuv420p"
     )
     out = WORK / f"clip_{idx:02d}.mp4"
     run([
-        "ffmpeg", "-y", "-loop", "1", "-i", str(img), "-i", str(audio),
-        "-vf", vf, "-af", "apad=pad_dur=0.5",
-        "-t", f"{dur:.2f}", "-r", "25",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2",
-        str(out),
+        "ffmpeg", "-y", "-loop", "1", "-i", str(img), "-vf", vf,
+        "-t", f"{dur:.2f}", "-r", str(FPS),
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-an", str(out),
     ])
-    return out, dur
+    return out
 
 
 def ass_time(t):
@@ -309,7 +447,7 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     for sc, dur in zip(scenes, durs):
         words = sc["narration"].split()
         chunks = [" ".join(words[i:i + CHUNK_WORDS]) for i in range(0, len(words), CHUNK_WORDS)]
-        speech = max(dur - 0.5, 0.5)
+        speech = max(dur - 0.3, 0.5)
         total_chars = sum(len(c) for c in chunks) or 1
         t = t0
         for c in chunks:
@@ -320,39 +458,39 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
     path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_video(images, voices, scenes):
-    clips, durs = [], []
-    for i, (img, aud) in enumerate(zip(images, voices)):
-        c, d = make_clip(img, aud, i, zoom_in=(i % 2 == 0))
-        clips.append(c)
-        durs.append(d)
-        log(f"clip {i + 1}/{len(images)} done ({d:.1f}s)")
+def build_video(images, narration, durs, scenes):
+    tail = 0.8
+    clips = []
+    for i, (img, d) in enumerate(zip(images, durs)):
+        d_i = d + (tail if i == len(durs) - 1 else 0)
+        clips.append(make_clip(img, d_i, i, zoom_in=(i % 2 == 0)))
+        log(f"clip {i + 1}/{len(images)} done ({d_i:.1f}s)")
     listfile = WORK / "clips.txt"
     listfile.write_text("".join(f"file '{c.name}'\n" for c in clips))
     joined = WORK / "joined.mp4"
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy", str(joined)])
 
-    total = sum(durs)
+    total = sum(durs) + tail
     subs = WORK / "subs.ass"
     make_subs(scenes, durs, subs)
 
-    # self-made ambient drone (no copyright issues); frequency varies per video
+    # quiet self-made ambience (no copyright issues); voice stays clearly on top
     f1 = random.choice([40, 45, 50, 55, 60])
     final = WORK / "final.mp4"
     fc = (
-        f"[0:a]volume=1.0[a0];"
-        f"[1:a]lowpass=f=400,volume=0.55[n];"
-        f"[2:a]volume=0.25,tremolo=f=0.3:d=0.6[s];"
+        f"[1:a]highpass=f=70,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=44100,apad=pad_dur=1[a0];"
+        f"[2:a]lowpass=f=250,volume=0.10[n];"
+        f"[3:a]volume=0.05,tremolo=f=0.25:d=0.7[s];"
         f"[a0][n][s]amix=inputs=3:duration=first:normalize=0,alimiter=limit=0.95[a];"
         f"[0:v]ass={subs.as_posix()}[v]"
     )
     run([
-        "ffmpeg", "-y", "-i", str(joined),
-        "-f", "lavfi", "-t", f"{total:.1f}", "-i", "anoisesrc=color=brown:sample_rate=44100:amplitude=0.4",
-        "-f", "lavfi", "-t", f"{total:.1f}", "-i", f"sine=frequency={f1}:sample_rate=44100",
+        "ffmpeg", "-y", "-i", str(joined), "-i", str(narration),
+        "-f", "lavfi", "-t", f"{total + 2:.1f}", "-i", "anoisesrc=color=brown:sample_rate=44100:amplitude=0.4",
+        "-f", "lavfi", "-t", f"{total + 2:.1f}", "-i", f"sine=frequency={f1}:sample_rate=44100",
         "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-t", f"{total:.2f}",
         str(final),
     ])
     log(f"Final video: {total:.0f}s -> {final}")
@@ -430,10 +568,11 @@ def main():
     history = load_history()
     story = make_story(history)
     scenes = story["scenes"]
-    voice = random.choice(VOICES)
-    voices = make_voice(scenes, voice)
-    images = make_images(scenes)
-    video, total = build_video(images, voices, scenes)
+    log(f"narrator: {story['narrator_gender']} | style: {story['visual_style'][:80]}")
+    narration, durs = make_voice(scenes, story["narrator_gender"])
+    narration, durs = fit_short(narration, durs)
+    images = make_images(scenes, story["visual_style"])
+    video, total = build_video(images, narration, durs, scenes)
 
     if MODE == "long" and total < 150:
         raise RuntimeError(f"Long video only {total:.0f}s, too short; aborting")
